@@ -266,9 +266,12 @@ impl ScanState {
         }
 
         // No outstanding work remains, so begin planning the next unopened file.
-        let part_file = match self.work_source.pop_front() {
-            Some(part_file) => part_file,
-            None => return ScanAndReturn::Done(None),
+        // A file list may not have listed the next file yet: then wait for it.
+        let part_file = match self.work_source.poll_next_file(cx) {
+            Poll::Ready(Ok(Some(part_file))) => part_file,
+            Poll::Ready(Ok(None)) => return ScanAndReturn::Done(None),
+            Poll::Ready(Err(err)) => return ScanAndReturn::Error(err),
+            Poll::Pending => return ScanAndReturn::Return(Poll::Pending),
         };
 
         self.metrics.time_opening.start();

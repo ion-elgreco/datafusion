@@ -28,6 +28,7 @@ pub(crate) mod sort_pushdown;
 mod proto;
 
 use crate::file_groups::FileGroup;
+use crate::file_list::FileList;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
     file_compression_type::FileCompressionType, file_stream::FileStreamBuilder,
@@ -178,6 +179,12 @@ pub struct FileScanConfig {
     /// `partitioned_by_file_group` is set, so a file is not guaranteed to be
     /// read by the partition it is grouped under here.
     pub file_groups: Vec<FileGroup>,
+    /// Files that are listed while the scan runs, read after the files of
+    /// `file_groups`. See [`FileList`].
+    ///
+    /// The number of partitions of the scan is still the number of
+    /// `file_groups`, which may be empty.
+    pub file_list: Option<Arc<dyn FileList>>,
     /// Table constraints
     pub constraints: Constraints,
     /// The maximum number of records to read from this plan. If `None`,
@@ -289,6 +296,7 @@ pub struct FileScanConfigBuilder {
     preserve_order: bool,
     constraints: Option<Constraints>,
     file_groups: Vec<FileGroup>,
+    file_list: Option<Arc<dyn FileList>>,
     statistics: Option<Statistics>,
     output_ordering: Vec<LexOrdering>,
     output_partitioning: Option<Partitioning>,
@@ -312,6 +320,7 @@ impl FileScanConfigBuilder {
             object_store_url,
             file_source,
             file_groups: vec![],
+            file_list: None,
             statistics: None,
             output_ordering: vec![],
             output_partitioning: None,
@@ -322,6 +331,16 @@ impl FileScanConfigBuilder {
             batch_size: None,
             expr_adapter_factory: None,
         }
+    }
+
+    /// Read the files that `file_list` lists while the scan runs, after the
+    /// files of the file groups. See [`FileList`].
+    ///
+    /// The file groups still set the number of partitions of the scan. Add
+    /// empty file groups to read the listed files with more partitions.
+    pub fn with_file_list(mut self, file_list: Arc<dyn FileList>) -> Self {
+        self.file_list = Some(file_list);
+        self
     }
 
     /// Set the maximum number of records to read from this plan.
@@ -533,6 +552,7 @@ impl FileScanConfigBuilder {
             preserve_order,
             constraints,
             file_groups,
+            file_list,
             statistics,
             output_ordering,
             output_partitioning,
@@ -558,6 +578,7 @@ impl FileScanConfigBuilder {
             preserve_order,
             constraints,
             file_groups,
+            file_list,
             output_ordering,
             file_compression_type,
             batch_size,
@@ -574,6 +595,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             object_store_url: config.object_store_url,
             file_source: Arc::<dyn FileSource>::clone(&config.file_source),
             file_groups: config.file_groups,
+            file_list: config.file_list,
             statistics: Some(config.statistics),
             output_ordering: config.output_ordering,
             output_partitioning: config.output_partitioning,
@@ -715,10 +737,17 @@ impl DataSource for FileScanConfig {
         // Extract the shared work source from the sibling state if it exists.
         // This allows multiple sibling streams to steal work from a single
         // shared queue of unopened files.
-        let shared_work_source = sibling_state
+        let mut shared_work_source = sibling_state
             .as_ref()
             .and_then(|state| state.downcast_ref::<SharedWorkSource>())
             .cloned();
+        if self.file_list.is_some() {
+            // The listed files reach the streams only through a shared work
+            // source, so a stream opened without sibling state gets its own.
+            let shared = shared_work_source
+                .get_or_insert_with(|| SharedWorkSource::from_config(self));
+            shared.set_task_context(&context);
+        }
 
         let stream = FileStreamBuilder::new(self)
             .with_partition(partition)
@@ -773,6 +802,10 @@ impl DataSource for FileScanConfig {
                     write!(f, ", limit={limit}")?;
                 }
 
+                if let Some(file_list) = &self.file_list {
+                    write!(f, ", file_list={file_list:?}")?;
+                }
+
                 display_orderings(f, &orderings)?;
 
                 if self.output_partitioning.is_some() {
@@ -806,6 +839,23 @@ impl DataSource for FileScanConfig {
         // would invalidate the partition-to-file-group mapping.
         if self.output_partitioning.is_some() {
             return Ok(None);
+        }
+
+        // With a file list, all streams take their files from one shared
+        // queue, so the file groups only set the number of partitions.
+        if self.file_list.is_some() {
+            if target_partitions <= self.file_groups.len() {
+                return Ok(None);
+            }
+            let mut file_groups = vec![vec![]; target_partitions];
+            let files = self.file_groups.iter().flat_map(FileGroup::iter);
+            for (index, file) in files.enumerate() {
+                file_groups[index % target_partitions].push(file.clone());
+            }
+            let config = FileScanConfigBuilder::from(self.clone())
+                .with_file_groups(file_groups.into_iter().map(FileGroup::new).collect())
+                .build();
+            return Ok(Some(Arc::new(config)));
         }
 
         let source = self.file_source.repartitioned(
@@ -923,7 +973,9 @@ impl DataSource for FileScanConfig {
         if let Some(partition) = partition {
             // Get statistics for a specific partition
             // Note: FileGroup statistics include partition columns (computed from partition_values)
-            if let Some(file_group) = self.file_groups.get(partition)
+            // With a file list, any partition can read any listed file.
+            if self.file_list.is_none()
+                && let Some(file_group) = self.file_groups.get(partition)
                 && let Some(stat) = file_group.file_statistics(None)
             {
                 // Project the statistics based on the projection
@@ -1186,9 +1238,13 @@ impl DataSource for FileScanConfig {
         &self,
         config: &ConfigOptions,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
-        if self.preserve_order
-            || self.output_partitioning.is_some()
-            || !config.execution.enable_file_stream_work_stealing
+        // A file list is opened once per execution, so its files must be
+        // shared by all sibling streams.
+        let must_share = self.file_list.is_some();
+        if !must_share
+            && (self.preserve_order
+                || self.output_partitioning.is_some()
+                || !config.execution.enable_file_stream_work_stealing)
         {
             return None;
         }
@@ -1265,6 +1321,12 @@ impl FileScanConfig {
     /// we can't guarantee the statistics are exact because we don't know how many
     /// rows will be filtered out.
     pub fn statistics(&self) -> Statistics {
+        if self.file_list.is_some() {
+            // The listed files are not known at planning time
+            return Statistics::new_unknown(
+                self.file_source.table_schema().table_schema(),
+            );
+        }
         let filter_may_change_row_count = self.file_source.filter().is_some()
             && self.statistics.num_rows != Precision::Exact(0);
         if filter_may_change_row_count {
@@ -1547,6 +1609,10 @@ impl DisplayAs for FileScanConfig {
 
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
+        }
+
+        if let Some(file_list) = &self.file_list {
+            write!(f, ", file_list={file_list:?}")?;
         }
 
         display_orderings(f, &orderings)?;

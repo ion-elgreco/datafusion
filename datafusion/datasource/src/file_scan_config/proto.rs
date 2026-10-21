@@ -63,6 +63,12 @@ impl FileScanConfig {
         &self,
         ctx: &ExecutionPlanEncodeCtx<'_>,
     ) -> Result<protobuf::FileScanExecConf> {
+        if self.file_list.is_some() {
+            // A decoded scan would read no listed files
+            return Err(DataFusionError::NotImplemented(
+                "serializing a FileScanConfig with a FileList".to_string(),
+            ));
+        }
         let file_groups = self
             .file_groups
             .iter()
